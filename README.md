@@ -121,3 +121,6 @@ curl -X POST "http://localhost:8000/ask" \
 ---
 
 **Status**: Production Ready | **License**: Public
+
+## Demo
+![alt text](image.png)
