@@ -1,0 +1,31 @@
+fastapi
+uvicorn
+
+# LLM + NLP
+transformers
+sentence-transformers
+torch
+
+# RAG / LangChain
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+langchain-chroma
+
+# Vector DB
+chromadb
+
+# Graph DB (nếu dùng Neo4j)
+neo4j
+langchain-neo4j
+
+# Data processing
+numpy
+pandas
+tqdm
+
+# Utils
+pydantic
+python-dotenv
+requests
