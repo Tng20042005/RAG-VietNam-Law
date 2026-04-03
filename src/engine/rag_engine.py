@@ -10,6 +10,10 @@ from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage
 
+# Thêm 3 dòng này vào khu vực import ở đầu file
+from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
+from langchain_core.prompts import PromptTemplate
+
 # VectorStore & Embeddings
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -23,7 +27,7 @@ class VietnamLawLangChainEngine:
     def __init__(self):
         # 1. Khởi tạo Gemini LLM
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-3-flash-preview",
+            model="gemini-2.5-flash",
             google_api_key=os.getenv("GEMINI_API_KEY"),
             temperature=0
         )
@@ -50,7 +54,55 @@ class VietnamLawLangChainEngine:
             model_kwargs={"dtype": "float16"}
         )
 
+        self.graph = Neo4jGraph(
+        url=os.getenv("NEO4J_URI"),
+        username=os.getenv("NEO4J_USERNAME"),
+        password=os.getenv("NEO4J_PASSWORD")
+    )
+    
+    # Tinh chỉnh Prompt một chút để Gemini viết Cypher chuẩn hơn
+        # Đã thêm biến {schema} để LangChain tự quét cấu trúc DB của bạn
+        # Tinh chỉnh Prompt: Thêm ví dụ mẫu (Few-shot) để Gemini bắt chước 100%
+        # Prompt mới: Cấm tìm theo tên Luật, chuyển sang tìm theo Từ Khóa trong Nội dung (NoiDung.text)
+        cypher_template = """
+        Task: Generate a Cypher query to answer the Vietnamese law question.
+        
+        Graph Schema Provided by Neo4j:
+        {schema}
+        
+        CRITICAL RULES (MUST FOLLOW):
+        1. WARNING: The 'name' property of VanBanLuat currently contains ID numbers, NOT real names. DO NOT USE `v.name` FOR SEARCHING!
+        2. To find a specific Article (Điều), filter by Article ID (`d.id CONTAINS 'Điều_X'`) AND search for keywords inside the content (`n.text`).
+        3. ALWAYS use `toLower()` and `CONTAINS` for text search.
+        
+        EXAMPLES:
+        User: "Điều 173 của Bộ luật Hình sự quy định về tội trộm cắp thế nào?"
+        Cypher Query: MATCH (d:DieuKhoan)-[:CO_NOI_DUNG]->(n:NoiDung) WHERE d.id CONTAINS 'Điều_173' AND (toLower(n.text) CONTAINS toLower('trộm cắp') OR toLower(n.text) CONTAINS toLower('hình sự')) RETURN d.id, n.text LIMIT 3
+        
+        User: "Hành vi trộm cắp tài sản bị phạt thế nào?"
+        Cypher Query: MATCH (h:Hanhvi)-[:BI_PHAT]->(m:Mucphat) WHERE toLower(h.id) CONTAINS toLower('trộm cắp') RETURN h.id, m.id LIMIT 3
+        
+        Question: {question}
+        Cypher Query:"""
+        
+        self.cypher_prompt = PromptTemplate(
+            input_variables=["schema", "question"], 
+            template=cypher_template
+        )
+        
+        # Dùng chính self.llm (Gemini) ở đây
+        self.graph_chain = GraphCypherQAChain.from_llm(
+            llm=self.llm, 
+            graph=self.graph,
+            verbose=True,
+            cypher_prompt=self.cypher_prompt,
+            allow_dangerous_requests=True,
+            return_direct=True
+        )
+    
+
     # --- BƯỚC 1: PHÂN TÍCH Ý ĐỊNH (Intent Chain) ---
+
     def get_intent_chain(self):
         prompt = ChatPromptTemplate.from_template("""
 Bạn là chuyên gia phân tích pháp luật. Hãy chuyển câu hỏi sau thành JSON điều khiển.
@@ -63,11 +115,14 @@ YÊU CẦU JSON:
 2. "source_years": Danh sách NĂM BAN HÀNH văn bản nhắc tới (VD: 'Luật 2013' -> [2013]). Nếu không nhắc năm cụ thể, để [].
 3. "target_year": Năm mà người dùng muốn kiểm tra hiệu lực (Mặc định là 2026).
 4. "is_status_check": true nếu người dùng hỏi về việc văn bản còn dùng được không/hết hiệu lực chưa.
-5. "is_legal_query": "Bắt buộc trả về  True nếu câu hỏi liên quan đến pháp luật, thủ tục hành chính, tội phạm,... Trả về  False nếu là các câu hỏi về đời thưởng như là giải trí, nấu ăn, thời tiết, code,..."
+5. "is_legal_query": Bắt buộc trả về True nếu câu hỏi liên quan đến pháp luật. Trả về False nếu ngoài luồng.
+6. "use_graph": BẮT BUỘC trả về true nếu câu hỏi thuộc các dạng: hỏi số lượng (có bao nhiêu điều/chương), hỏi cấu trúc, hỏi danh sách, hoặc yêu cầu trích xuất chính xác MỘT ĐIỀU LUẬT CỤ THỂ (VD: Điều 173 nói về gì?). Các trường hợp tư vấn tình huống thì trả về false.
 
 CHỈ TRẢ RA JSON, KHÔNG GIẢI THÍCH.
         """)
         return prompt | self.llm | JsonOutputParser()
+
+
 
     # --- BƯỚC 2: RERANKER (Hàm bổ trợ cho LangChain) ---
     def rerank_logic(self, input_data):
@@ -110,6 +165,36 @@ CHỈ TRẢ RA JSON, KHÔNG GIẢI THÍCH.
         intent_chain = self.get_intent_chain()
         intent = intent_chain.invoke({"query": query, "history": history_str})
 
+        if intent.get("use_graph") is True:
+            yield "🔍 **[Chế độ Graph]** Đang truy vấn cấu trúc dữ liệu pháp luật...\n\n"
+            try:
+                # 1. Gọi Graph Chain
+                graph_res = self.graph_chain.invoke({"query": intent["rewritten_query"]})
+                
+                # 2. Lấy dữ liệu ra (Lưu ý: return_direct=True thì kết quả thường nằm trực tiếp ở graph_res)
+                # Nếu graph_res là dictionary thì lấy ["result"], nếu không thì lấy chính nó
+                data = graph_res.get("result") if isinstance(graph_res, dict) else graph_res
+
+                # 3. XỬ LÝ LỖI 'LIST': Biến danh sách thành chuỗi văn bản
+                if isinstance(data, list):
+                    if not data:
+                        yield "Không tìm thấy thông tin phù hợp trong sơ đồ luật."
+                    else:
+                        readable_text = ""
+                        for record in data:
+                            # Ưu tiên lấy cột 'n.text' (Nội dung luật) mà chúng ta đã RETURN trong Cypher
+                            content = record.get('n.text', str(record))
+                            readable_text += f"{content}\n\n"
+                        yield readable_text
+                else:
+                    # Nếu nó là chuỗi (String) rồi thì cứ thế yield thôi
+                    yield str(data)
+
+                return 
+            except Exception as e:
+                yield f"⚠️ *Lỗi truy vấn Graph: {str(e)}... Đang chuyển sang tìm kiếm chuyên sâu...*\n\n"
+
+            
         if intent.get("is_legal_query") is False:
             yield "Xin lỗi bạn, với vai trò là một trợ lý tư vấn pháp luật Việt Nam, tôi chỉ có thể giải đáp các vấn đề liên quan đến quy định nhà nước, thủ tục pháp lý và luật pháp. Tôi không thể hỗ trợ bạn các vấn đề ngoài luồng như nấu ăn, giải trí hay đời sống thường ngày được."
             return 
